@@ -1,2 +1,3 @@
 data/
 image_label_dataset.npz
+generated_dataset.npz
