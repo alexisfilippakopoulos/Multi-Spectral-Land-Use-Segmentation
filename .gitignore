@@ -5,3 +5,6 @@ best_model_lr_0.01.pt
 best_model_lr_0.001.pt
 best_model_lr_0.0001.pt
 best_model_lr_1e-05.pt
+pred_mask.tif
+predicted_mask.npy
+pred_mask_colored.tif
