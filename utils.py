@@ -16,6 +16,8 @@ from collections import Counter
 import os
 import rasterio
 import cv2
+from sklearn.metrics import confusion_matrix
+
 
 class LandUseDataset(torch.utils.data.Dataset):
     """
@@ -48,8 +50,8 @@ class LandUseDataset(torch.utils.data.Dataset):
         return len(self.X)
 
     def __getitem__(self, idx):
-        X = torch.tensor(self.X[idx], dtype=torch.float32)  # (C=13, H, W)
-        y = torch.tensor(self.y[idx], dtype=torch.long)     # (H, W)
+        X = torch.tensor(self.X[idx], dtype=torch.float32)
+        y = torch.tensor(self.y[idx], dtype=torch.long)
 
         if self.transform:
             X = self.transform(X)
@@ -144,10 +146,10 @@ class UNetResNet50(nn.Module):
         self.encoder_relu = resnet.relu
         self.encoder_maxpool = resnet.maxpool
 
-        self.encoder_layer1 = resnet.layer1  # 256
-        self.encoder_layer2 = resnet.layer2  # 512
-        self.encoder_layer3 = resnet.layer3  # 1024
-        self.encoder_layer4 = resnet.layer4  # 2048
+        self.encoder_layer1 = resnet.layer1
+        self.encoder_layer2 = resnet.layer2
+        self.encoder_layer3 = resnet.layer3
+        self.encoder_layer4 = resnet.layer4
 
         self.upconv4 = self._upsample(2048, 1024)
         self.upconv3 = self._upsample(1024 + 1024, 512)
@@ -290,7 +292,7 @@ def pansharpen_to_10m_and_save(directory, output_tiff="pansharpened.tif"):
                 img = src.read(1)
 
                 if band in BANDS_10M:
-                    sharpened = img  # No resizing needed
+                    sharpened = img  
                 else:
                     sharpened = cv2.resize(
                         img,
@@ -549,11 +551,11 @@ def validate(model, val_dl, device, criterion, num_classes):
         for X, y in val_dl:
             X, y = X.to(device), y.to(device)
 
-            logits = model(X)  # shape: [B, C, H, W]
+            logits = model(X)
             loss = criterion(logits, y)
             curr_loss += loss.item()
 
-            preds = torch.argmax(logits, dim=1)  # shape: [B, H, W]
+            preds = torch.argmax(logits, dim=1)
             preds_flat = preds.flatten()
             y_flat = y.flatten()
 
@@ -599,7 +601,7 @@ def train_model(model, num_epochs, device, train_loader, val_loader, num_classes
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=7, verbose=True)
     model.to(device)
 
-    best_score = -1.0
+    best_score = -1.0   
     metrics = {"train_losses": [], "val_losses": [], "pixel_accs": [], "mean_ious": []}
     for epoch in range(num_epochs):
         avg_train_loss = train_one_epoch(model, optimizer, train_loader, device, criterion)
@@ -626,3 +628,123 @@ def train_model(model, num_epochs, device, train_loader, val_loader, num_classes
 
     print(f"\nBest model recorded a score of: 0.5 * Pixel-Level Accuracy + 0.5 * Macro-Averaged IoU = {best_score:.4f}")
     return metrics, best_score
+
+
+def predict_full_tile(model, tiff_path, device, patch_size=128, stride=64, num_classes=8, output_path="predicted_mask.npy"):
+    """
+    Perform sliding window inference on a large TIFF tile using disk streaming.
+
+    Args:
+        model: Trained model.
+        tiff_path: Path to the input GeoTIFF.
+        device: 'cuda' or 'cpu'.
+        patch_size: Size of square patches.
+        stride: Step size between patches.
+        num_classes: Number of classes.
+        output_path: Where to save the prediction.
+    """
+    model.eval()
+
+    with rasterio.open(tiff_path) as src:
+        H, W = src.height, src.width
+        output_probs = np.zeros((num_classes, H, W), dtype=np.float32)
+        count = np.zeros((H, W), dtype=np.float32)
+
+        with torch.no_grad():
+            for row in tqdm(range(0, H - patch_size + 1, stride)):
+                for col in range(0, W - patch_size + 1, stride):
+                    patch = src.read(window=rasterio.windows.Window(col, row, patch_size, patch_size))
+                    if patch.shape[1] != patch_size or patch.shape[2] != patch_size:
+                        continue
+
+                    # normalize and convert to  tensor
+                    patch = patch.astype(np.float32) / 10000.0
+                    patch = np.clip(patch, 0.0, 1.0)
+                    patch_tensor = torch.from_numpy(patch).unsqueeze(0).to(device)
+
+                    logits = model(patch_tensor)
+                    probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+
+                    output_probs[:, row:row + patch_size, col:col + patch_size] += probs
+                    count[row:row + patch_size, col:col + patch_size] += 1
+
+        avg_probs = output_probs / np.clip(count, 1e-8, None)
+        final_prediction = np.argmax(avg_probs, axis=0).astype(np.uint8)
+        np.save(output_path, final_prediction)
+        print(f"Prediction saved to {output_path}")
+        return final_prediction
+
+
+def save_prediction_geotiff(prediction, reference_tiff_path, output_path):
+    """
+    Save the predicted mask as a GeoTIFF using the georeferencing info from the original tile.
+
+    Args:
+        prediction (np.ndarray): 2D array of predicted class IDs (H, W).
+        reference_tiff_path (str): Path to the original input GeoTIFF (e.g., Sentinel-2 tile).
+        output_path (str): Path to save the output GeoTIFF.
+    """
+    with rasterio.open(reference_tiff_path) as src:
+        profile = src.profile
+        transform = src.transform
+        crs = src.crs
+
+    # ppdate profile for single-band uint8 mask
+    profile.update({
+        'driver': 'GTiff',
+        'height': prediction.shape[0],
+        'width': prediction.shape[1],
+        'count': 1,
+        'dtype': 'uint8',
+        'transform': transform,
+        'crs': crs
+    })
+
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        dst.write(prediction, 1)
+
+    print(f"GeoTIFF saved to: {output_path}")
+
+def compute_metrics(pred_mask, true_mask, class_ids, ignore_index=None):
+    """
+    Evaluate semantic segmentation results.
+    
+    Args:
+        pred_mask: 2D numpy array of predicted class IDs.
+        true_mask: 2D numpy array of true class IDs.
+        class_ids: List of valid class IDs to evaluate (e.g., [10, 20, 30, ..., 90]).
+        ignore_index: Optional value to ignore in evaluation (e.g., background).
+        
+    Returns:
+        Dictionary with pixel accuracy, per-class IoU, mean IoU, and confusion matrix.
+    """
+
+    pred = pred_mask.flatten()
+    true = true_mask.flatten()
+    
+    if ignore_index is not None:
+        valid = true != ignore_index
+        pred = pred[valid]
+        true = true[valid]
+    
+    cm = confusion_matrix(true, pred, labels=class_ids)
+    
+    intersection = np.diag(cm)
+    ground_truth_set = cm.sum(axis=1)
+    predicted_set = cm.sum(axis=0)
+    union = ground_truth_set + predicted_set - intersection
+    
+    iou_per_class = intersection / np.maximum(union, 1e-10)
+    mean_iou = np.mean(iou_per_class)
+    pixel_accuracy = np.sum(intersection) / np.maximum(np.sum(cm), 1e-10)
+
+    freq = ground_truth_set / np.maximum(np.sum(ground_truth_set), 1e-10)
+    fw_iou = np.sum(freq * iou_per_class)
+    
+    return {
+        "pixel_accuracy": pixel_accuracy,
+        "iou_per_class": dict(zip(class_ids, iou_per_class)),
+        "mean_iou": mean_iou,
+        "freq_weighted_iou": fw_iou,
+        "confusion_matrix": cm
+    }
