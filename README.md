@@ -1,1 +1,6 @@
-# Geo-Spatial-Data-Analysis
+# Multi-Spectral-Land-Use-Segmentation
+
+
+This project tackles the problem of land use semantic segmentation from high-resolution satellite imagery, where each pixel of an image is classified into a discrete set of land cover categories. We begin with downloading low-cloud-coverage Sentinel-2 (satellite) image data from the Copernicus platform, focusing on Thessaly, Greece for the training data and on Pelloponese, Greece for the testing dat. We process these images by pansharpening all spectral bands to 10 m resolution, aligning coordinate systems, and creating a balanced patch-based dataset. We normalize the data, augment them with geometric and radiometric transformations and split them into training and validation sets.
+
+The utilized model architecture is a U-Net with a ResNet-50 encoder pretrained on ImageNet, adapted to handle 13-channel input. Training involved the Adam optimizer with a reduce-on-plateau scheduler, using cross-entropy loss and monitoring pixel accuracy and macro-averaged IoU. A grid search over learning rates revealed that 0.0001 offered the best trade-off, achieving a macro-averaged IoU of 0.6638, pixel accuracy of 0.8887, and composite score of 0.7763 on validation data. Results showed strong performance on majority classes but weaknesses on underrepresented categories, reflecting the dataset’s imbalance.
